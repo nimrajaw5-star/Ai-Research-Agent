@@ -17,6 +17,59 @@ from crewai import Agent, Task, Crew, Process, LLM
 from tools import duckduckgo_search
 
 
+# -----------------------------------------------------------------------
+# Compatibility patch (safe to keep even after CrewAI fixes this upstream)
+# -----------------------------------------------------------------------
+# Some CrewAI/LiteLLM versions tag every outgoing message with an
+# Anthropic-only "cache_breakpoint" marker used for prompt caching. Groq's
+# API doesn't recognize that field and rejects the whole request with:
+#   GroqException - property 'cache_breakpoint' is unsupported
+#
+# This wraps LiteLLM's actual request functions and strips that one key
+# from messages right before they go out over the network, no matter which
+# internal CrewAI code path added it. It's a no-op for any message that
+# doesn't have the key, so it's safe for other providers too.
+# Background: https://github.com/crewAIInc/crewAI/issues/5886
+def _patch_litellm_cache_breakpoint() -> None:
+    try:
+        import litellm
+    except ImportError:
+        return
+
+    def _strip(messages):
+        if not messages:
+            return messages
+        return [
+            {k: v for k, v in m.items() if k != "cache_breakpoint"}
+            if isinstance(m, dict)
+            else m
+            for m in messages
+        ]
+
+    original_completion = getattr(litellm, "completion", None)
+    if original_completion and not getattr(original_completion, "_cache_breakpoint_patched", False):
+        def patched_completion(*args, **kwargs):
+            if "messages" in kwargs:
+                kwargs["messages"] = _strip(kwargs["messages"])
+            return original_completion(*args, **kwargs)
+
+        patched_completion._cache_breakpoint_patched = True
+        litellm.completion = patched_completion
+
+    original_acompletion = getattr(litellm, "acompletion", None)
+    if original_acompletion and not getattr(original_acompletion, "_cache_breakpoint_patched", False):
+        async def patched_acompletion(*args, **kwargs):
+            if "messages" in kwargs:
+                kwargs["messages"] = _strip(kwargs["messages"])
+            return await original_acompletion(*args, **kwargs)
+
+        patched_acompletion._cache_breakpoint_patched = True
+        litellm.acompletion = patched_acompletion
+
+
+_patch_litellm_cache_breakpoint()
+
+
 def build_crew(topic: str, groq_api_key: str) -> Crew:
     """Builds (but does not run) the Crew for a given research topic."""
 
@@ -82,6 +135,13 @@ def build_crew(topic: str, groq_api_key: str) -> Crew:
     )
 
     return crew
+
+
+def run_research(topic: str, groq_api_key: str) -> str:
+    """Builds the crew and runs it, returning the final report as text."""
+    crew = build_crew(topic, groq_api_key)
+    result = crew.kickoff()
+    return str(result)
 
 
 def run_research(topic: str, groq_api_key: str) -> str:
